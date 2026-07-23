@@ -35,6 +35,7 @@ Engine_Agnes : CroneEngine {
     var <recSynth, <synth;
     var history, freeze, posBus, ampBus;
     var sr, histFrames;
+    var duck = 0.03;   // fade-to-silence time used to bracket a capture
 
     *new { arg context, doneCallback;
         ^super.new(context, doneCallback);
@@ -73,8 +74,10 @@ Engine_Agnes : CroneEngine {
                 diffuse   = 0,     // spectral phase-diffusion rate (Hz); 0 = off
                 specGain  = 1,     // spectral level trim
                 blend     = 0.5,   // dry/wet
-                fade      = 0.05,  // wet fade time (s)
-                wet       = 1;
+                fade      = 0.05,  // fade-IN time after a capture (s)
+                duck      = 0.03,  // fade-OUT time when a capture starts (s)
+                gate      = 1,     // 1 = sounding, 0 = ducked to silence
+                t_recapture = 0;   // trigger: new capture just landed
 
             var dry, ptr, gran;
             var frames, phase, src, chain, frz, spec;
@@ -90,13 +93,18 @@ Engine_Agnes : CroneEngine {
             // ---- SPECTRAL ------------------------------------------------
             // Loop a playhead through the valid captured region only.
             frames = BufFrames.kr(buf) * playFrac;
-            phase  = Phasor.ar(0, BufRateScale.kr(buf) * pitch, 0, frames);
+            // reset to the head of the new capture when one lands
+            phase  = Phasor.ar(T2A.ar(t_recapture),
+                        BufRateScale.kr(buf) * pitch, 0, frames);
             src    = BufRd.ar(1, buf, phase, loop: 1);
 
             chain = FFT(LocalBuf(4096), src, hop: 0.25, wintype: 1);   // Hann
             // refresh = 0 -> hold forever; refresh > 0 -> periodically re-grab
             frz   = Select.kr(refresh > 0,
                         [DC.kr(1), LFPulse.kr(refresh, 0, 0.9)]);
+            // A capture must force an unfreeze, or with refresh = 0 the spectral
+            // side would hold the PREVIOUS capture forever.
+            frz   = frz * (1 - Trig.kr(t_recapture, 0.25));
             chain = PV_MagFreeze(chain, frz);
             // Phase diffusion: smears the metallic ring of a held spectrum.
             // Trigger-driven, so `diffuse` is a rate. 0 = bypassed.
@@ -108,7 +116,9 @@ Engine_Agnes : CroneEngine {
             sAmp = sin(morph * 0.5pi);
             sig  = (gran * gAmp) + (spec * sAmp);
 
-            amp = Lag.kr(wet, fade);
+            // Gated linear envelope. Unlike Lag this reaches true zero in a
+            // known time, which is what lets the capture be bracketed cleanly.
+            amp = EnvGen.kr(Env.asr(fade, 1, duck, \lin), gate);
             mix = (dry * (1 - blend)) + (sig * amp * blend);
 
             // wet-only amplitude for the UI (not the dry passthrough)
@@ -121,7 +131,8 @@ Engine_Agnes : CroneEngine {
         recSynth = Synth.new(\agnesRec,
             [\buf, history, \posOut, posBus], context.xg);
         synth = Synth.after(recSynth, \agnesVoice,
-            [\buf, freeze, \out, context.out_b, \ampOut, ampBus], context.xg);
+            [\buf, freeze, \out, context.out_b, \ampOut, ampBus,
+             \duck, duck], context.xg);
 
         // ---- Poll --------------------------------------------------------
         // Wet amplitude, for the grid UI. If your norns version disagrees with
@@ -130,22 +141,37 @@ Engine_Agnes : CroneEngine {
 
         // ---- Commands ----------------------------------------------------
 
+        // Capture is sequenced in time so the buffer swap happens in silence:
+        //   duck -> wait -> copy -> wait for server -> repoint readers -> fade up
+        // Doing it in one block (as a plain set) is what caused the click.
         this.addCommand("capture", "f", { arg msg;
             var sizeSec = msg[1].clip(0.05, 5.0);
             var len = (sizeSec * sr).asInteger;
-            posBus.get({ arg norm;
-                var writeFrame = (norm * histFrames).asInteger;
-                var start = (writeFrame - len) % histFrames;
+            {
+                var norm, writeFrame, start, first;
+
+                // 1. fade the wet path to true silence
+                synth.set(\gate, 0);
+                (duck + 0.01).wait;
+
+                // 2. swap buffer contents while nothing audible is reading them
+                norm       = posBus.getSynchronous;
+                writeFrame = (norm * histFrames).asInteger;
+                start      = (writeFrame - len) % histFrames;
                 if ((start + len) <= histFrames) {
                     history.copyData(freeze, 0, start, len);
                 } {
-                    var first = histFrames - start;
+                    first = histFrames - start;
                     history.copyData(freeze, 0, start, first);
                     history.copyData(freeze, first, 0, len - first);
                 };
-                synth.set(\playFrac, len / histFrames, \wet, 0);
-                synth.set(\wet, 1);
-            });
+                0.05.wait;                       // let the copy land server-side
+
+                // 3. repoint readers, force a spectral re-grab, fade back up
+                synth.set(\playFrac, len / histFrames);
+                synth.set(\t_recapture, 1);
+                synth.set(\gate, 1);
+            }.fork(SystemClock);                 // SystemClock: waits are seconds
         });
 
         this.addCommand("morph",    "f", { arg m; synth.set(\morph,    m[1]); });

@@ -15,6 +15,13 @@
 -- regularity - granular is irregular, spectral resolves into stillness.
 -- brightness pulses with the wet signal.
 --
+-- encoders:  E1 morph (granular <> spectral)
+--            E2 blend (dry/wet)
+--            E3 scan position (where in the capture the grains read from)
+-- keys:      K2 capture   K3 hold to show grain size on E3 instead
+--
+-- moving an encoder briefly shows its value, then fades back to the bare grid.
+--
 -- controls map to the 16n Faderbank over MIDI (edit the CC numbers below).
 --
 -- engine: Agnes  (Engine_Agnes.sc in this script's lib/ folder)
@@ -48,6 +55,8 @@ local FPS      = 15
 local m
 local ui_metro
 local splash    = true
+local k3        = false          -- held: E3 edits grain size
+local hud       = { label = "", value = "", ttl = 0 }
 local t         = 0     -- animation phase (seconds)
 local amp       = 0     -- wet amplitude, from poll
 local flash     = 0     -- brief brightening on capture
@@ -143,6 +152,7 @@ end
 function tick()
   t = t + (1 / FPS)
   if flash > 0 then flash = math.max(0, flash - 0.06) end
+  if hud.ttl > 0 then hud.ttl = hud.ttl - (1 / FPS) end
   redraw()
 end
 
@@ -152,17 +162,34 @@ function capture()
 end
 
 function key(n, z)
+  if n == 3 then k3 = (z == 1) end
   if z == 1 then
     if splash then splash = false; return end
     if n == 2 then capture() end
   end
 end
 
+local function show(label, value)
+  hud.label, hud.value, hud.ttl = label, value, 1.5
+end
+
 function enc(n, d)
   if splash then splash = false; return end
-  if     n == 1 then params:delta("morph", d)
-  elseif n == 2 then params:delta("blend", d)
-  elseif n == 3 then params:delta("grain", d)
+  if n == 1 then
+    params:delta("morph", d)
+    local mo = params:get("morph")
+    show("morph", string.format("%s %.2f", mo < 0.5 and "gran" or "spec", mo))
+  elseif n == 2 then
+    params:delta("blend", d)
+    show("blend", string.format("%.2f", params:get("blend")))
+  elseif n == 3 then
+    if k3 then
+      params:delta("grain", d)
+      show("grain size", string.format("%.0f ms", params:get("grain") * 1000))
+    else
+      params:delta("pos", d)
+      show("scan", string.format("%.2f", params:get("pos")))
+    end
   end
 end
 
@@ -214,12 +241,13 @@ function draw_grid()
     end
   end
 
-  -- minimal readout, bottom edge
-  screen.level(3)
-  screen.move(0, 63)
-  screen.text(string.format("%.1fs", params:get("capture_size")))
-  screen.move(128, 63)
-  screen.text_right(mo < 0.5 and "gran" or "spec")
+  -- readout appears only while you are touching something, then fades out
+  if hud.ttl > 0 then
+    local k = util.clamp(hud.ttl / 1.5, 0, 1)
+    screen.level(math.floor(2 + k * 10))
+    screen.move(0, 63);   screen.text(hud.label)
+    screen.move(128, 63); screen.text_right(hud.value)
+  end
 end
 
 function redraw()
