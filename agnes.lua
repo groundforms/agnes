@@ -18,7 +18,9 @@
 -- encoders:  E1 morph (granular <> spectral)
 --            E2 blend (dry/wet)
 --            E3 scan position (where in the capture the grains read from)
--- keys:      K2 capture   K3 hold to show grain size on E3 instead
+-- keys:      K2 capture
+--            K3 hold: E3 edits grain size instead of scan position
+--            K1+K2 hold 2s: clear the buffer (panels wipe right to left)
 --
 -- moving an encoder briefly shows its value, then fades back to the bare grid.
 --
@@ -37,7 +39,8 @@ local CC_MORPH   = 34   -- fader 3: granular <-> spectral
 local CC_GRAIN   = 35   -- fader 4: grain size (granular texture)
 local CC_POS     = 36   -- fader 5: scan position through the capture
 local CC_REFRESH = 37   -- fader 6: spectral refresh rate
-local CC_DIFFUSE = 38   -- fader 7: spectral phase diffusion
+local CC_SPECWIN = 38   -- fader 7: spectral analysis window
+local CC_DIFFUSE = 41   -- fader 10: spectral phase diffusion
 local CC_FADE    = 39   -- fader 8: fade time
 local CC_PITCH   = 40   -- fader 9: pitch
 local CC_CAPTURE = 48   -- 8mu button (val > 0 triggers capture); optional
@@ -52,10 +55,19 @@ local TOP      = 12
 local BOT      = 54
 local FPS      = 15
 
+local function show(label, value)
+  hud.label, hud.value, hud.ttl = label, value, 1.5
+end
+
 local m
 local ui_metro
 local splash    = true
+local k1        = false
+local k2        = false
 local k3        = false          -- held: E3 edits grain size
+local clear_hold = 0             -- 0..1 progress of the K1+K2 clear gesture
+local cleared    = false         -- latch, so clear fires once per hold
+local CLEAR_SECS = 2.0
 local hud       = { label = "", value = "", ttl = 0 }
 local t         = 0     -- animation phase (seconds)
 local amp       = 0     -- wet amplitude, from poll
@@ -90,12 +102,16 @@ function init()
   params:set_action("drift", function(v) engine.drift(v) end)
 
   params:add_control("refresh", "spec refresh",
-    controlspec.new(0, 8, "lin", 0, 0.5, "hz"))
+    controlspec.new(0, 8, "lin", 0, 0, "hz"))
   params:set_action("refresh", function(v) engine.refresh(v) end)
 
   params:add_control("diffuse", "spec diffuse",
     controlspec.new(0, 20, "lin", 0, 0, "hz"))
   params:set_action("diffuse", function(v) engine.diffuse(v) end)
+
+  params:add_control("spec_win", "spec window",
+    controlspec.new(0.05, 2.0, "exp", 0, 0.3, "s"))
+  params:set_action("spec_win", function(v) engine.specWin(v) end)
 
   params:add_control("spec_gain", "spec trim",
     controlspec.new(0, 4, "lin", 0, 1.0, "x"))
@@ -130,6 +146,7 @@ function init()
       elseif d.cc == CC_GRAIN   then params:set_raw("grain", f)
       elseif d.cc == CC_POS     then params:set_raw("pos", f)
       elseif d.cc == CC_REFRESH then params:set_raw("refresh", f)
+      elseif d.cc == CC_SPECWIN then params:set_raw("spec_win", f)
       elseif d.cc == CC_DIFFUSE then params:set_raw("diffuse", f)
       elseif d.cc == CC_FADE    then params:set_raw("fade", f)
       elseif d.cc == CC_PITCH   then params:set_raw("pitch", f)
@@ -153,6 +170,19 @@ function tick()
   t = t + (1 / FPS)
   if flash > 0 then flash = math.max(0, flash - 0.06) end
   if hud.ttl > 0 then hud.ttl = hud.ttl - (1 / FPS) end
+
+  -- K1+K2 held: wipe progresses, fires once at the top
+  if k1 and k2 then
+    clear_hold = math.min(1, clear_hold + (1 / FPS) / CLEAR_SECS)
+    if clear_hold >= 1 and not cleared then
+      engine.clear()
+      cleared = true
+      show("cleared", "")
+    end
+  else
+    clear_hold = 0
+    cleared = false
+  end
   redraw()
 end
 
@@ -162,15 +192,14 @@ function capture()
 end
 
 function key(n, z)
+  if n == 1 then k1 = (z == 1) end
+  if n == 2 then k2 = (z == 1) end
   if n == 3 then k3 = (z == 1) end
   if z == 1 then
     if splash then splash = false; return end
-    if n == 2 then capture() end
+    -- K1 held turns K2 into the clear gesture, so don't also capture
+    if n == 2 and not k1 then capture() end
   end
-end
-
-local function show(label, value)
-  hud.label, hud.value, hud.ttl = label, value, 1.5
 end
 
 function enc(n, d)
@@ -230,6 +259,11 @@ function draw_grid()
 
       local lv = wave * (0.28 + 0.72 * a) + jitter
       if p == lit then lv = lv + 0.18 end
+      -- clear gesture: panels go blank from the right as you hold
+      if clear_hold > 0 and (PANELS - 1 - p) < (clear_hold * PANELS) then
+        lv = lv * 0.12
+      end
+
       lv = util.clamp(lv + flash * 0.6, 0, 1)
 
       if lv > 0.04 then

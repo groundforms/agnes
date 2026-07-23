@@ -26,6 +26,25 @@
 // POLL: publishes wet amplitude as "agnesAmp" so the Lua UI can pulse with the
 // sound. See the note in agnes.lua if the poll API differs on your version.
 //
+// ---- TODO (next iteration): hear norns TAPE playback ----------------------
+// The recorder below taps SoundIn.ar(0), i.e. hardware input only. Tape
+// playback is mixed in DOWNSTREAM of the engine in Crone's graph, so the
+// history buffer currently cannot hear it. Options, best first:
+//
+//   1. Check whether Crone exposes a tape/playback bus an engine can read.
+//      Cleanest if it exists. Verify against the Crone source on YOUR norns
+//      version - the bus layout has changed over time, so don't assume.
+//   2. Read the main output bus instead. Works, but this engine's own output
+//      is on that bus, so it creates a feedback path. Would need a pre-engine
+//      tap or gating, and gating fights the always-listening design.
+//   3. Route tape out and back in physically. Inelegant, definitely works,
+//      good for proving the idea is worth the effort before building it.
+//
+// Related tidy-up worth doing at the same time: switch SoundIn.ar(0) to
+// In.ar(context.in_b, 1). Functionally the same today, but it's the idiomatic
+// norns tap point and it's where the source change would land.
+// --------------------------------------------------------------------------
+//
 // Core UGens only (FFT / PV_MagFreeze / PV_Diffuser / IFFT / Warp1) - no
 // sc3-plugins dependency.
 //
@@ -36,6 +55,11 @@ Engine_Agnes : CroneEngine {
     var history, freeze, posBus, ampBus;
     var sr, histFrames;
     var duck = 0.03;   // fade-to-silence time used to bracket a capture
+    // FFT size: time vs frequency resolution. 4096 = ~85ms analysis window,
+    // smooth but smears transients together. 2048 = ~43ms, tighter in time,
+    // coarser in pitch. 1024 = ~21ms, tight but poor low-end resolution, bad
+    // for kicks. Changing this needs a script restart (SynthDef-time constant).
+    var fftSize = 2048;
 
     *new { arg context, doneCallback;
         ^super.new(context, doneCallback);
@@ -73,6 +97,7 @@ Engine_Agnes : CroneEngine {
                 refresh   = 0.5,   // spectral re-grab rate (Hz); 0 = fully frozen
                 diffuse   = 0,     // spectral phase-diffusion rate (Hz); 0 = off
                 specGain  = 1,     // spectral level trim
+                specWin   = 0.3,   // spectral analysis window at `pos` (s)
                 blend     = 0.5,   // dry/wet
                 fade      = 0.05,  // fade-IN time after a capture (s)
                 duck      = 0.03,  // fade-OUT time when a capture starts (s)
@@ -80,7 +105,7 @@ Engine_Agnes : CroneEngine {
                 t_recapture = 0;   // trigger: new capture just landed
 
             var dry, ptr, gran;
-            var frames, phase, src, chain, frz, spec;
+            var src, chain, frz, spec;
             var gAmp, sAmp, sig, amp, mix;
 
             dry = SoundIn.ar(0);
@@ -91,14 +116,20 @@ Engine_Agnes : CroneEngine {
             gran = Warp1.ar(1, buf, ptr, pitch, grainSize, -1, overlaps, scatter, 1);
 
             // ---- SPECTRAL ------------------------------------------------
-            // Loop a playhead through the valid captured region only.
-            frames = BufFrames.kr(buf) * playFrac;
-            // reset to the head of the new capture when one lands
-            phase  = Phasor.ar(T2A.ar(t_recapture),
-                        BufRateScale.kr(buf) * pitch, 0, frames);
-            src    = BufRd.ar(1, buf, phase, loop: 1);
+            // Source is a SECOND Warp1, not a looping playhead over raw audio.
+            // A raw loop has a waveform discontinuity at the wrap point, and
+            // PV_MagFreeze freezes MAGNITUDES ONLY - phase still comes from the
+            // input - so that discontinuity came straight through the freeze as
+            // a tick, once per loop period. Warp1 overlap-adds windowed grains,
+            // so its output is continuous by construction and there is no wrap
+            // point to click on.
+            //
+            // It reads from the same `ptr` as the granular side, so both engines
+            // agree on position. specWin is its window size, so it still sets
+            // how much material around `pos` the spectrum sees.
+            src   = Warp1.ar(1, buf, ptr, pitch, specWin, -1, 4, 0.02, 1);
 
-            chain = FFT(LocalBuf(4096), src, hop: 0.25, wintype: 1);   // Hann
+            chain = FFT(LocalBuf(fftSize), src, hop: 0.25, wintype: 1);   // Hann
             // refresh = 0 -> hold forever; refresh > 0 -> periodically re-grab
             frz   = Select.kr(refresh > 0,
                         [DC.kr(1), LFPulse.kr(refresh, 0, 0.9)]);
@@ -108,8 +139,12 @@ Engine_Agnes : CroneEngine {
             chain = PV_MagFreeze(chain, frz);
             // Phase diffusion: smears the metallic ring of a held spectrum.
             // Trigger-driven, so `diffuse` is a rate. 0 = bypassed.
-            chain = PV_Diffuser(chain, Impulse.kr(diffuse));
-            spec  = IFFT(chain, wintype: 1) * specGain;
+            // (diffuse > 0) gates the trigger, so 0 is a real bypass rather
+            // than "one randomisation at synth start, held forever"
+            chain = PV_Diffuser(chain, Impulse.kr(diffuse) * (diffuse > 0));
+            // A held spectrum can carry DC in bin 0; multiplied by the moving
+            // gate envelope that becomes a thump on every capture.
+            spec  = LeakDC.ar(IFFT(chain, wintype: 1)) * specGain;
 
             // ---- EQUAL-POWER MORPH ---------------------------------------
             gAmp = cos(morph * 0.5pi);
@@ -174,10 +209,24 @@ Engine_Agnes : CroneEngine {
             }.fork(SystemClock);                 // SystemClock: waits are seconds
         });
 
+        // Clear: same duck-then-modify sequencing as capture, so wiping the
+        // buffer under a sounding grain cloud doesn't click.
+        this.addCommand("clear", "", {
+            {
+                synth.set(\gate, 0);
+                (duck + 0.01).wait;
+                freeze.zero;
+                0.02.wait;
+                synth.set(\playFrac, 1);
+                // gate stays 0: nothing to sound until the next capture
+            }.fork(SystemClock);
+        });
+
         this.addCommand("morph",    "f", { arg m; synth.set(\morph,    m[1]); });
         this.addCommand("refresh",  "f", { arg m; synth.set(\refresh,  m[1]); });
         this.addCommand("diffuse",  "f", { arg m; synth.set(\diffuse,  m[1]); });
         this.addCommand("specGain", "f", { arg m; synth.set(\specGain, m[1]); });
+        this.addCommand("specWin",  "f", { arg m; synth.set(\specWin,  m[1]); });
         this.addCommand("blend",    "f", { arg m; synth.set(\blend,    m[1]); });
         this.addCommand("fade",     "f", { arg m; synth.set(\fade,     m[1]); });
         this.addCommand("grainSize","f", { arg m; synth.set(\grainSize,m[1]); });
