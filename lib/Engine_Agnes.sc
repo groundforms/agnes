@@ -98,6 +98,8 @@ Engine_Agnes : CroneEngine {
                 diffuse   = 0,     // spectral phase-diffusion rate (Hz); 0 = off
                 specGain  = 1,     // spectral level trim
                 specWin   = 0.3,   // spectral analysis window at `pos` (s)
+                specMove  = 0.3,   // how far the analysis point wanders (0 = still)
+                hold      = 0.8,   // freeze duty: 1 = always held, 0 = always live
                 blend     = 0.5,   // dry/wet
                 fade      = 0.05,  // fade-IN time after a capture (s)
                 duck      = 0.03,  // fade-OUT time when a capture starts (s)
@@ -105,7 +107,7 @@ Engine_Agnes : CroneEngine {
                 t_recapture = 0;   // trigger: new capture just landed
 
             var dry, ptr, gran;
-            var src, chain, frz, spec;
+            var specPtr, src, chain, frz, spec;
             var gAmp, sAmp, sig, amp, mix;
 
             dry = SoundIn.ar(0);
@@ -127,12 +129,24 @@ Engine_Agnes : CroneEngine {
             // It reads from the same `ptr` as the granular side, so both engines
             // agree on position. specWin is its window size, so it still sets
             // how much material around `pos` the spectrum sees.
-            src   = Warp1.ar(1, buf, ptr, pitch, specWin, -1, 4, 0.02, 1);
+            // A STATIONARY analysis point makes every re-grab identical, which
+            // is what made this feel dead. specMove wanders it slowly around
+            // `pos` (within roughly specWin) so successive re-grabs catch
+            // different material - the movement that made the first version
+            // feel smeared and alive, but now confined near pos rather than
+            // roaming the whole capture.
+            specPtr = (ptr + (LFNoise2.kr(drift * 4)
+                        * (specWin / BufDur.kr(buf)) * specMove))
+                        .clip(0, playFrac);
+            src   = Warp1.ar(1, buf, specPtr, pitch, specWin, -1, 4, 0.05, 1);
 
             chain = FFT(LocalBuf(fftSize), src, hop: 0.25, wintype: 1);   // Hann
             // refresh = 0 -> hold forever; refresh > 0 -> periodically re-grab
+            // refresh = rate of re-grab; hold = how much of each cycle is
+            // frozen. hold 1 = never reopens, hold 0 = never freezes (a live
+            // spectral smear of the granular source, the most "alive" setting).
             frz   = Select.kr(refresh > 0,
-                        [DC.kr(1), LFPulse.kr(refresh, 0, 0.9)]);
+                        [DC.kr(1), LFPulse.kr(refresh, 0, hold)]);
             // A capture must force an unfreeze, or with refresh = 0 the spectral
             // side would hold the PREVIOUS capture forever.
             frz   = frz * (1 - Trig.kr(t_recapture, 0.25));
@@ -227,6 +241,8 @@ Engine_Agnes : CroneEngine {
         this.addCommand("diffuse",  "f", { arg m; synth.set(\diffuse,  m[1]); });
         this.addCommand("specGain", "f", { arg m; synth.set(\specGain, m[1]); });
         this.addCommand("specWin",  "f", { arg m; synth.set(\specWin,  m[1]); });
+        this.addCommand("specMove", "f", { arg m; synth.set(\specMove, m[1]); });
+        this.addCommand("hold",     "f", { arg m; synth.set(\hold,     m[1]); });
         this.addCommand("blend",    "f", { arg m; synth.set(\blend,    m[1]); });
         this.addCommand("fade",     "f", { arg m; synth.set(\fade,     m[1]); });
         this.addCommand("grainSize","f", { arg m; synth.set(\grainSize,m[1]); });

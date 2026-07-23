@@ -55,10 +55,6 @@ local TOP      = 12
 local BOT      = 54
 local FPS      = 15
 
-local function show(label, value)
-  hud.label, hud.value, hud.ttl = label, value, 1.5
-end
-
 local m
 local ui_metro
 local splash    = true
@@ -72,6 +68,11 @@ local hud       = { label = "", value = "", ttl = 0 }
 local t         = 0     -- animation phase (seconds)
 local amp       = 0     -- wet amplitude, from poll
 local flash     = 0     -- brief brightening on capture
+
+-- must be declared after `hud`, or `hud` resolves to a nil global in here
+local function show(label, value)
+  hud.label, hud.value, hud.ttl = label, value, 1.5
+end
 
 function init()
   params:add_control("capture_size", "capture size",
@@ -102,12 +103,20 @@ function init()
   params:set_action("drift", function(v) engine.drift(v) end)
 
   params:add_control("refresh", "spec refresh",
-    controlspec.new(0, 8, "lin", 0, 0, "hz"))
+    controlspec.new(0, 8, "lin", 0, 0.4, "hz"))
   params:set_action("refresh", function(v) engine.refresh(v) end)
 
   params:add_control("diffuse", "spec diffuse",
     controlspec.new(0, 20, "lin", 0, 0, "hz"))
   params:set_action("diffuse", function(v) engine.diffuse(v) end)
+
+  params:add_control("hold", "spec hold",
+    controlspec.new(0, 1, "lin", 0, 0.8, ""))
+  params:set_action("hold", function(v) engine.hold(v) end)
+
+  params:add_control("spec_move", "spec move",
+    controlspec.new(0, 1, "lin", 0, 0.3, ""))
+  params:set_action("spec_move", function(v) engine.specMove(v) end)
 
   params:add_control("spec_win", "spec window",
     controlspec.new(0.05, 2.0, "exp", 0, 0.3, "s"))
